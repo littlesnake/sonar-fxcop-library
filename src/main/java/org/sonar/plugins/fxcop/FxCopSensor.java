@@ -22,6 +22,7 @@ package org.sonar.plugins.fxcop;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonar.api.batch.Sensor;
@@ -40,7 +41,11 @@ import org.sonar.api.rules.ActiveRule;
 import javax.annotation.Nullable;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 public class FxCopSensor implements Sensor {
 
@@ -106,18 +111,87 @@ public class FxCopSensor implements Sensor {
       LOG.debug("Using the provided FxCop report" + reportPath);
       reportFile = new File(reportPath);
     }
+      for (FxCopIssue issue : parser.parse(reportFile)) {
+    	File file = null;
+        File tempFile = null;
+        String outSideSonarQube = null;
+        int line = 0;	
+        String message = "";
 
-    for (FxCopIssue issue : parser.parse(reportFile)) {
-      if (!hasFileAndLine(issue)) {
-        logSkippedIssue(issue, "which has no associated file.");
-        continue;
-      }
-
-      File file = new File(new File(issue.path()), issue.file());
+        File projectBaseDirectory = fs.baseDir();
+        if(hasFile(issue)) {
+            file = new File(new File(issue.path()), issue.file());
+            if (!hasLine(issue)) {
+            	line = 1; 
+            }
+            line = issue.line(); 
+            message = issue.message();         
+          } 
+          else {
+        	    file =  srchFileInDirectory(projectBaseDirectory, "AssemblyInfo.cs"); 
+        	    if (file == null)
+        	    	file =  srchFileInDirectory(projectBaseDirectory, ".cs");	
+        	    line = 1;
+        	    message = issue.message() 
+        			+ " {File name may not be correct" 
+        			+ ". Search file based on class/assembly name appearing in this message}.";
+          }
       InputFile inputFile = fs.inputFile(fs.predicates().and(fs.predicates().hasType(Type.MAIN), fs.predicates().hasAbsolutePath(file.getAbsolutePath())));
-      if (inputFile == null) {
-        logSkippedIssueOutsideOfSonarQube(issue, file);
-      } else if (fxCopConf.languageKey().equals(inputFile.language())) {
+      if (inputFile == null)
+      { 
+      	outSideSonarQube = issue.file();
+      	if (outSideSonarQube != null)
+      	{
+      		List<File> fileList = srchFiles(projectBaseDirectory, outSideSonarQube);
+       		if (fileList.isEmpty())
+      		{
+      			tempFile = srchFileInDirectory(projectBaseDirectory, "AssemblyInfo.cs");
+      			if (tempFile == null)
+      			{
+      			   tempFile =  srchFileInDirectory(projectBaseDirectory, ".cs");	
+      			}
+
+      			inputFile =  fs.inputFile(fs.predicates().and(fs.predicates().hasType(Type.MAIN), fs.predicates().hasAbsolutePath(tempFile.getAbsolutePath())));
+      			message = issue.message() 
+      	    			+ " {File name may not be correct" 
+      	    			+ ". Search file based on class/assembly name appearing in this message}.";
+      		}
+      		else
+      		{   
+      			// to handle case when two or more .cs files have same name but in different directory
+      			for (File currentFile : fileList) {
+      			  inputFile = fs.inputFile(fs.predicates().and(fs.predicates().hasType(Type.MAIN), fs.predicates().hasAbsolutePath(currentFile.getAbsolutePath())));
+      			  if (inputFile != null) {
+      				  break;
+      			  }
+      			}
+      			if (inputFile == null && outSideSonarQube.endsWith(".cs") && !(outSideSonarQube.endsWith(".g.cs")) 
+      					&& !(outSideSonarQube.endsWith(".g.i.cs")) && !(outSideSonarQube.endsWith(".Designer.cs")))
+      			{
+      				inputFile = fs.inputFile(fs.predicates().and(fs.predicates().hasType(Type.MAIN), fs.predicates().hasAbsolutePath(srchFileInDirectory(projectBaseDirectory, "AssemblyInfo.cs").getAbsolutePath())));
+      				if (inputFile == null)
+      					inputFile = fs.inputFile(fs.predicates().and(fs.predicates().hasType(Type.MAIN), fs.predicates().hasAbsolutePath(srchFileInDirectory(projectBaseDirectory, ".cs").getAbsolutePath())));
+      				    
+      				message = issue.message() 
+      		    			+ " {File name may not be correct" 
+      		    			+ ". Search file based on class/assembly name appearing in this message}.";
+      			}      			
+      		}      	
+         }
+      	 else 
+      	 {
+      		inputFile = fs.inputFile(fs.predicates().and(fs.predicates().hasType(Type.MAIN), fs.predicates().hasAbsolutePath(srchFileInDirectory(projectBaseDirectory, "AssemblyInfo.cs").getAbsolutePath())));
+      		if (inputFile == null)
+      			inputFile = fs.inputFile(fs.predicates().and(fs.predicates().hasType(Type.MAIN), fs.predicates().hasAbsolutePath(srchFileInDirectory(projectBaseDirectory, ".cs").getAbsolutePath())));
+      		message = issue.message() 
+		    			+ " {File name may not be correct" 
+		    			+ ". Search file based on class/assembly name appearing in this message}.";
+      	 }
+      }
+     if (inputFile == null && issue != null && issue.file() != null && (issue.file().endsWith(".g.cs") || issue.file().endsWith(".g.i.cs")
+    		 || issue.file().endsWith(".Designer.cs") || issue.file().endsWith(".xaml") ) ){ 
+    	logSkippedIssueOutsideOfSonarQube(issue, file);
+      } else if (inputFile != null && fxCopConf.languageKey().equals(inputFile.language())) {
         Issuable issuable = perspectives.as(Issuable.class, inputFile);
         if (issuable == null) {
           logSkippedIssueOutsideOfSonarQube(issue, file);
@@ -125,13 +199,64 @@ public class FxCopSensor implements Sensor {
           issuable.addIssue(
             issuable.newIssueBuilder()
               .ruleKey(RuleKey.of(fxCopConf.repositoryKey(), ruleKey(issue.ruleConfigKey())))
-              .line(issue.line())
-              .message(issue.message())
+              .line(line)
+              .message(message)
               .build());
         }
       }
     }
   }
+    
+  public static File srchFileInDirectory(File directoryName, String fileName)
+  {
+	  File srchedFile = null;
+	  for (File srcFile: listFileTree(directoryName)) {
+		  if(srcFile.getName().equals(fileName))      {  
+			  srchedFile = srcFile; 
+			  break;  
+		  }
+	   }
+	  if (srchedFile == null) {
+		  for (File srcFile: listFileTree(directoryName)) {			  
+	   	      	if (srcFile.getName().endsWith(fileName)) {
+	   	    	  srchedFile = srcFile;   		   
+	   	    	  break;
+		        }
+	      }
+	  }
+	  
+	  return srchedFile;
+  }
+  
+  public static List<File> srchFiles(File directoryName, String fileName)
+  {
+	  List<File> fileList = new ArrayList<File>();
+	  for (File srcFile: listFileTree(directoryName))    {
+		    if(srcFile.getName().equals(fileName))      {  
+			  fileList.add(srcFile); 
+		    }
+	   }
+	  if (fileList.isEmpty()) {
+		  for (File srcFile: listFileTree(directoryName)) {			  
+	   	      	if (srcFile.getName().endsWith(fileName)) {
+	   	      	 fileList.add(srcFile);   		   
+	   	    	  break;
+		        }
+	      }
+	  }
+	  
+	  return fileList;
+  }
+  
+  public static Collection<File> listFileTree(File dir) {
+	    Set<File> fileTree = new HashSet<>();
+	  	for (File entry : dir.listFiles()) {
+	        if (entry.isFile()) fileTree.add(entry);
+	        else fileTree.addAll(listFileTree(entry));	    	
+	    }
+	  	
+	    return fileTree;
+}
 
   private static List<String> splitOnCommas(@Nullable String property) {
     if (property == null) {
@@ -141,8 +266,12 @@ public class FxCopSensor implements Sensor {
     }
   }
 
-  private static boolean hasFileAndLine(FxCopIssue issue) {
-    return issue.path() != null && issue.file() != null && issue.line() != null;
+  private static boolean hasFile(FxCopIssue issue) {
+	return issue.path() != null && issue.file() != null;
+  }
+  
+  private static boolean hasLine(FxCopIssue issue) {
+	return issue.line() != null;
   }
 
   private static void logSkippedIssueOutsideOfSonarQube(FxCopIssue issue, File file) {
